@@ -761,3 +761,69 @@ deploy/packages/
 
 - **macOS**: `node --check` で構文 OK、Chrome headless でコンソールエラーなしを確認
 - **Windows**: 実機未検証。`本体：...html` を除外する設計的対処のみ。中身は Mac 版と byte-for-byte 同一なので、Windows Chrome/Edge で正常動作する想定
+
+---
+
+## Web Tooling / Standalone HTML
+
+When bundling JS libraries (PDF.js, pdf-lib, fontkit etc.) into a single HTML
+that must run from `file://` (double-click to open), CSP needs the following
+**minimum** to avoid silent failures across Chrome/Edge/Safari/Firefox:
+
+```
+script-src  'self' 'unsafe-inline' 'unsafe-eval' blob:
+worker-src  'self' blob:
+default-src 'self' blob: data:
+connect-src 'self' blob: data:    ← keeps http(s) blocked = no exfiltration
+```
+
+**Why each is required**:
+- `'unsafe-inline'`: inlined `<script>` blocks of bundled libraries
+- `'unsafe-eval'`: pdf-lib / pdf.js use `new Function()` internally
+- `blob:` (script-src + worker-src): Web Workers MUST be loaded from a Blob URL
+  when bundled (no separate file). Without `worker-src blob:` PDF rendering
+  silently fails (black screen) on Chrome; Windows fails earlier (no UI).
+- `connect-src` excluding `http(s):` is what preserves zero-exfiltration.
+  Local eval is acceptable when external send is impossible.
+
+**Symptoms when CSP is wrong**:
+- macOS: UI works, file picker opens, but PDF → black screen (worker blocked)
+- Windows: file picker doesn't open (early JS exception from blocked eval)
+
+Full case study: Phase 7 → "v1.1 → v1.2" in this file.
+
+---
+
+## PDF Tool — distribution layout
+
+- Source edits live in `deploy/pdf_tool/pdf_tool.html` (lib-referencing variant).
+- Bundled files are **generated** by `src/build_bundled.py --lang {ja,en}`. Never
+  hand-edit them:
+  - `pdf_tool_bundled.html` — JP-default (`data-default-lang="ja"`)
+  - `pdf_tool_bundled_en.html` — EN-default (`data-default-lang="en"`)
+- `src/build_packages.py` runs `build_bundled.py` for both langs and produces
+  **four** OS+language-specific zips in `deploy/packages/`:
+  - `PDF_Tool_Mac_JP.zip` — entry: `本体：ダブルクリックで作動.html`, guide: `使い方ガイド.html`
+  - `PDF_Tool_Mac_EN.zip` — entry: `Start_Here.html`, guide: `usage_guide.html`
+  - `PDF_Tool_Windows_JP.zip` — entry: `pdf_tool_bundled.html`, guide: `使い方ガイド.html`
+  - `PDF_Tool_Windows_EN.zip` — entry: `pdf_tool_bundled.html`, guide: `usage_guide.html`
+  Each zip has its own embedded SHA256SUMS.txt. See `deploy/pdf_tool/WINDOWS_DEBUG_NOTES.md`
+  for the NFD/NFC-vs-U+FF1A story (why the JP Mac filename is excluded from Windows).
+- **JP/EN language toggle**: runtime switch via `JP | EN` button in toolbar. Language
+  priority: `?lang=` URL → `localStorage.pdfToolLang` → `data-default-lang` attr →
+  `navigator.language`. `data-default-lang` is the only difference between JP and EN
+  bundled files.
+- Editor features (for future planning context): Word-style margin comments
+  (new annotation type, baked into page on export), thumbnail multi-select
+  (Shift/Ctrl click + Shift+Arrow range extend + plain Arrow move), zoom
+  (mutable `VIEW_SCALE`), font registry pulldown (bundled Sawarabi Gothic +
+  user-loaded .ttf/.otf), strikethrough fill handles incl. perpendicular
+  gap-adjust handle (v1.3+), single-page rotation fallback to viewport-center
+  page when no thumbnails are selected (v1.3+).
+- Annotation sizes (text fontSize, frame/pen/strikethrough strokeWidth) are
+  stored in **PDF points directly** — `state.toolSize / VIEW_SCALE` was
+  removed in v1.3 so saved-PDF appearance no longer depends on the zoom level
+  active at insertion time. `pointToPdf` uses SVG `getScreenCTM().inverse()`
+  to avoid CSS sub-pixel drift.
+
+_Last updated: 2026-06-21 (v1.5.0) — see CHANGELOG.md for details._

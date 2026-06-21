@@ -180,6 +180,9 @@ def run_build_bundled():
             sys.exit(f"build_bundled.py --lang {lang} failed")
         last_line = r.stdout.strip().split("\n")[-1] if r.stdout.strip() else ""
         print(f"  [{lang}] {last_line}")
+    # Keep the Finder-friendly Mac JP entry point byte-identical to the
+    # generated Japanese bundle. It is a generated artifact, never a source.
+    shutil.copy2(BUNDLED_FILES["ja"], DEPLOY_DIR / MAC_FRIENDLY_FILENAME_JP)
 
 
 def sha256_file(p: Path) -> str:

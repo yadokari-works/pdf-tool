@@ -3,7 +3,7 @@
 A privacy-first, offline PDF editor that runs entirely in your browser.
 No server, no upload, no installation — just double-click and edit.
 
-**Current version: v1.4.0**
+**Current version: v1.5.0**
 
 ## Features
 

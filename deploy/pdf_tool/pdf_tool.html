@@ -1328,6 +1328,11 @@ const state = {
                               // (shows fill handle + allows drag-move). Clicking
                               // anywhere on a comment box activates it; clicking
                               // outside any comment deactivates.
+  renderGen: 0,         // bumped on every refresh() call; lets in-flight
+                        // renderPages()/renderThumbnails() loops detect that
+                        // they've been superseded and stop appending, so two
+                        // overlapping refreshes (e.g. rapid rotate clicks)
+                        // can't interleave DOM nodes into #viewer/#strip.
 };
 
 // ----- DOM refs -------------------------------------------------------------
@@ -1365,8 +1370,25 @@ async function loadPdfFromFile(file) {
     const { width, height } = p.getSize();
     return { width, height };
   });
+  if (state.pageSizes.length > 0) {
+    VIEW_SCALE = fitWidthScale(state.pageSizes[0].width);
+    updateZoomLabel();
+  }
   await refresh();
   toast(t('msg.pdfLoaded', {name: file.name, n: state.pdfDoc.getPageCount()}));
+}
+
+// Compute a VIEW_SCALE so the page frame (page + comment gutter, the unit
+// #viewer centers as a whole) spans edge-to-edge on first open. Since the
+// page-wrap sits flush against the frame's left edge, this puts the page's
+// own left edge at the viewer's left edge; the near-invisible comment
+// gutter (background: rgba(255,255,255,0.02)) absorbs the remaining width
+// on the right, reading visually as ordinary margin rather than dead space.
+function fitWidthScale(pageWidthPt) {
+  const padding = 24 * 2; // #viewer's left+right padding
+  const available = Math.max(100, viewer.clientWidth - padding);
+  const scale = available / (pageWidthPt + GUTTER_PT);
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, scale));
 }
 
 async function appendPdfFromFile(file) {
@@ -1397,7 +1419,10 @@ async function imagesToPdf(files) {
 }
 
 // Persist current pdfDoc → bytes, then reload + refresh UI.
-async function persist() {
+/** Save+reload state.pdfDoc/pdfBytes/pageSizes without re-rendering anything.
+ *  Shared by persist() (full rebuild) and rotatePages() (targeted patch via
+ *  patchPages(), which doesn't want #viewer/#strip touched). */
+async function persistBytesOnly() {
   state.pdfBytes = await state.pdfDoc.save();
   state.pdfDoc = await PDFDocument.load(state.pdfBytes);
   state.pageSizes = state.pdfDoc.getPages().map(p => {
@@ -1408,11 +1433,16 @@ async function persist() {
   state.selected = null;
   state.activeCommentKey = null;
   hidePropertyPanel();
+}
+
+async function persist() {
+  await persistBytesOnly();
   await refresh();
 }
 
 // ----- Render ---------------------------------------------------------------
 async function refresh() {
+  const myGen = ++state.renderGen;
   const has = state.pdfDoc && state.pdfDoc.getPageCount() > 0;
   btnSave.disabled = !has;
   btnPagenum.disabled = !has;
@@ -1428,76 +1458,87 @@ async function refresh() {
   }
   if (welcome.parentNode) welcome.remove();
   info.textContent = t('msg.fileInfo', {name: state.fileName, n: state.pdfDoc.getPageCount()});
-  await renderPages();
-  await renderThumbnails();
+  await renderPages(myGen);
+  if (myGen !== state.renderGen) return;
+  await renderThumbnails(myGen);
 }
 
-async function renderPages() {
+/** Build one #viewer page-frame (page-wrap + canvas + overlays) for 1-based
+ *  pdf.js page number `i`. Shared by the full renderPages() rebuild and by
+ *  patchPages()'s in-place single-page update (used after rotation so the
+ *  rest of #viewer — and the scroll position — is left untouched). */
+async function buildPageFrame(pdfjsDoc, i) {
+  const page = await pdfjsDoc.getPage(i);
+  const viewport = page.getViewport({ scale: VIEW_SCALE });
+
+  const pdfW = viewport.width / VIEW_SCALE;
+  const pdfH = viewport.height / VIEW_SCALE;
+  const gutterCssW = GUTTER_PT * VIEW_SCALE;
+
+  // Outer container: page-frame. Width INCLUDES the gutter so that
+  // #viewer's align-items:center centers "page + gutter" as a unit —
+  // the gutter is reserved space on the right of the page. The comment
+  // gutter and leader-svg are absolutely positioned inside this frame
+  // (not flex children) so flex sizing rules cannot squish them.
+  const frame = document.createElement("div");
+  frame.className = "page-frame";
+  frame.dataset.pageIndex = String(i - 1);
+  frame.style.width = (viewport.width + gutterCssW) + "px";
+  frame.style.height = viewport.height + "px";
+
+  const wrap = document.createElement("div");
+  wrap.className = "page-wrap";
+  wrap.dataset.pageIndex = String(i - 1);
+  wrap.style.width = viewport.width + "px";
+  wrap.style.height = viewport.height + "px";
+
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  wrap.appendChild(canvas);
+
+  // SVG overlay in PDF point space (viewBox = page size).
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.classList.add("overlay");
+  svg.setAttribute("viewBox", `0 0 ${pdfW} ${pdfH}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  wrap.appendChild(svg);
+
+  frame.appendChild(wrap);
+
+  // Comment gutter — absolutely positioned immediately to the right of the
+  // page, OUTSIDE the flex-sizing calculations. It physically extends
+  // beyond page-frame's nominal box (which is only as wide as the page).
+  const gutter = document.createElement("div");
+  gutter.className = "comment-gutter";
+  gutter.dataset.pageIndex = String(i - 1);
+  gutter.style.left   = viewport.width + "px";        // right edge of page
+  gutter.style.width  = gutterCssW + "px";
+  gutter.style.height = viewport.height + "px";
+  frame.appendChild(gutter);
+
+  // Leader-line SVG spans page + gutter area. ViewBox is in PDF points
+  // so anchor (page coords) and boxX (may be > pdfW) map 1:1 with
+  // annotation storage. Absolutely positioned at frame origin, extends to
+  // the right past the frame's visible box (overflow: visible in CSS).
+  const leaderSvg = document.createElementNS(SVG_NS, "svg");
+  leaderSvg.classList.add("leader-svg");
+  leaderSvg.setAttribute("viewBox", `0 0 ${pdfW + GUTTER_PT} ${pdfH}`);
+  leaderSvg.setAttribute("preserveAspectRatio", "none");
+  leaderSvg.style.width  = (viewport.width + gutterCssW) + "px";
+  leaderSvg.style.height = viewport.height + "px";
+  frame.appendChild(leaderSvg);
+
+  return { frame, wrap, svg, canvas, viewport, page };
+}
+
+async function renderPages(myGen) {
   viewer.innerHTML = "";
   // Use a fresh copy because PDF.js may detach the buffer.
   const pdfjsDoc = await pdfjsLib.getDocument({ data: state.pdfBytes.slice(0) }).promise;
   for (let i = 1; i <= pdfjsDoc.numPages; i++) {
-    const page = await pdfjsDoc.getPage(i);
-    const viewport = page.getViewport({ scale: VIEW_SCALE });
-
-    const pdfW = viewport.width / VIEW_SCALE;
-    const pdfH = viewport.height / VIEW_SCALE;
-    const gutterCssW = GUTTER_PT * VIEW_SCALE;
-
-    // Outer container: page-frame. Width INCLUDES the gutter so that
-    // #viewer's align-items:center centers "page + gutter" as a unit —
-    // the gutter is reserved space on the right of the page. The comment
-    // gutter and leader-svg are absolutely positioned inside this frame
-    // (not flex children) so flex sizing rules cannot squish them.
-    const frame = document.createElement("div");
-    frame.className = "page-frame";
-    frame.dataset.pageIndex = String(i - 1);
-    frame.style.width = (viewport.width + gutterCssW) + "px";
-    frame.style.height = viewport.height + "px";
-
-    const wrap = document.createElement("div");
-    wrap.className = "page-wrap";
-    wrap.dataset.pageIndex = String(i - 1);
-    wrap.style.width = viewport.width + "px";
-    wrap.style.height = viewport.height + "px";
-
-    const canvas = document.createElement("canvas");
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    wrap.appendChild(canvas);
-
-    // SVG overlay in PDF point space (viewBox = page size).
-    const svg = document.createElementNS(SVG_NS, "svg");
-    svg.classList.add("overlay");
-    svg.setAttribute("viewBox", `0 0 ${pdfW} ${pdfH}`);
-    svg.setAttribute("preserveAspectRatio", "none");
-    wrap.appendChild(svg);
-
-    frame.appendChild(wrap);
-
-    // Comment gutter — absolutely positioned immediately to the right of the
-    // page, OUTSIDE the flex-sizing calculations. It physically extends
-    // beyond page-frame's nominal box (which is only as wide as the page).
-    const gutter = document.createElement("div");
-    gutter.className = "comment-gutter";
-    gutter.dataset.pageIndex = String(i - 1);
-    gutter.style.left   = viewport.width + "px";        // right edge of page
-    gutter.style.width  = gutterCssW + "px";
-    gutter.style.height = viewport.height + "px";
-    frame.appendChild(gutter);
-
-    // Leader-line SVG spans page + gutter area. ViewBox is in PDF points
-    // so anchor (page coords) and boxX (may be > pdfW) map 1:1 with
-    // annotation storage. Absolutely positioned at frame origin, extends to
-    // the right past the frame's visible box (overflow: visible in CSS).
-    const leaderSvg = document.createElementNS(SVG_NS, "svg");
-    leaderSvg.classList.add("leader-svg");
-    leaderSvg.setAttribute("viewBox", `0 0 ${pdfW + GUTTER_PT} ${pdfH}`);
-    leaderSvg.setAttribute("preserveAspectRatio", "none");
-    leaderSvg.style.width  = (viewport.width + gutterCssW) + "px";
-    leaderSvg.style.height = viewport.height + "px";
-    frame.appendChild(leaderSvg);
-
+    if (myGen !== state.renderGen) return;   // superseded by a newer refresh()
+    const { frame, wrap, svg, canvas, viewport, page } = await buildPageFrame(pdfjsDoc, i);
     viewer.appendChild(frame);
     await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 
@@ -1508,54 +1549,94 @@ async function renderPages() {
   }
 }
 
-async function renderThumbnails() {
+/** Build one thumbnail-strip wrapper for 1-based pdf.js page number `i`.
+ *  Shared by the full renderThumbnails() rebuild and by patchPages(). */
+async function buildThumbWrapper(pdfjsDoc, i) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "thumb";
+  wrapper.dataset.pageNum = String(i);
+
+  const canvas = document.createElement("canvas");
+  const page = await pdfjsDoc.getPage(i);
+  const baseViewport = page.getViewport({ scale: 1 });
+  const scale = Math.min(80 / baseViewport.width, 100 / baseViewport.height);
+  const viewport = page.getViewport({ scale });
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  wrapper.appendChild(canvas);
+
+  const label = document.createElement("div");
+  label.className = "thumb-label";
+  label.textContent = String(i);
+  wrapper.appendChild(label);
+
+  const del = document.createElement("button");
+  del.className = "thumb-del";
+  del.textContent = "×";
+  del.title = t('thumb.delTitle');
+  del.addEventListener("pointerdown", e => e.stopPropagation());
+  del.addEventListener("click", e => {
+    e.stopPropagation();
+    deletePage(parseInt(wrapper.dataset.pageNum));
+  });
+  wrapper.appendChild(del);
+
+  wrapper.addEventListener("click", (e) => {
+    if (wrapper._suppressClick) { wrapper._suppressClick = false; return; }
+    const pageIdx = parseInt(wrapper.dataset.pageNum) - 1;
+    handleThumbClick(pageIdx, e);
+    // Only scroll into view on plain click (no modifier).
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      const wraps = viewer.querySelectorAll(".page-wrap");
+      const target = wraps[pageIdx];
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  });
+
+  attachThumbnailDrag(wrapper);
+  return wrapper;
+}
+
+async function renderThumbnails(myGen) {
   strip.innerHTML = "";
   const pdfjsDoc = await pdfjsLib.getDocument({ data: state.pdfBytes.slice(0) }).promise;
   for (let i = 1; i <= pdfjsDoc.numPages; i++) {
-    const wrapper = document.createElement("div");
-    wrapper.className = "thumb";
-    wrapper.dataset.pageNum = String(i);
-
-    const canvas = document.createElement("canvas");
-    const page = await pdfjsDoc.getPage(i);
-    const baseViewport = page.getViewport({ scale: 1 });
-    const scale = Math.min(80 / baseViewport.width, 100 / baseViewport.height);
-    const viewport = page.getViewport({ scale });
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-    wrapper.appendChild(canvas);
-
-    const label = document.createElement("div");
-    label.className = "thumb-label";
-    label.textContent = String(i);
-    wrapper.appendChild(label);
-
-    const del = document.createElement("button");
-    del.className = "thumb-del";
-    del.textContent = "×";
-    del.title = t('thumb.delTitle');
-    del.addEventListener("pointerdown", e => e.stopPropagation());
-    del.addEventListener("click", e => {
-      e.stopPropagation();
-      deletePage(parseInt(wrapper.dataset.pageNum));
-    });
-    wrapper.appendChild(del);
-
-    wrapper.addEventListener("click", (e) => {
-      if (wrapper._suppressClick) { wrapper._suppressClick = false; return; }
-      const pageIdx = parseInt(wrapper.dataset.pageNum) - 1;
-      handleThumbClick(pageIdx, e);
-      // Only scroll into view on plain click (no modifier).
-      if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
-        const wraps = viewer.querySelectorAll(".page-wrap");
-        const target = wraps[pageIdx];
-        if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
-    });
-
-    attachThumbnailDrag(wrapper);
+    if (myGen !== state.renderGen) return;   // superseded by a newer refresh()
+    const wrapper = await buildThumbWrapper(pdfjsDoc, i);
     strip.appendChild(wrapper);
+  }
+  updateThumbSelectionClass();
+}
+
+/** Re-render just `targets` (0-based page indices) in place — the rest of
+ *  #viewer / #strip (and their scroll positions) are left untouched. Used
+ *  after rotation, which doesn't add/remove/reorder pages, so a full
+ *  persist()+refresh() rebuild would be a needlessly disruptive way to
+ *  reflect the new rotation angle. */
+async function patchPages(targets, myGen) {
+  const pdfjsDoc = await pdfjsLib.getDocument({ data: state.pdfBytes.slice(0) }).promise;
+  for (const idx of targets) {
+    if (myGen !== state.renderGen) return;
+    const i = idx + 1; // pdf.js pages are 1-based
+    if (i < 1 || i > pdfjsDoc.numPages) continue;
+
+    const oldFrame = viewer.querySelector(`.page-frame[data-page-index="${idx}"]`);
+    const { frame, wrap, svg, canvas, viewport, page } = await buildPageFrame(pdfjsDoc, i);
+    if (myGen !== state.renderGen) return;
+    if (oldFrame) oldFrame.replaceWith(frame);
+    else viewer.appendChild(frame);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    if (myGen !== state.renderGen) return;
+    drawAnnotationsForPage(idx);
+    attachToolHandlers(wrap, svg, idx);
+    applyToolModeToPage(wrap);
+
+    const oldThumb = strip.querySelector(`.thumb[data-page-num="${i}"]`);
+    const thumbWrapper = await buildThumbWrapper(pdfjsDoc, i);
+    if (myGen !== state.renderGen) return;
+    if (oldThumb) oldThumb.replaceWith(thumbWrapper);
+    else strip.appendChild(thumbWrapper);
   }
   updateThumbSelectionClass();
 }
@@ -1746,6 +1827,17 @@ async function reorderPdf(sourceIdx, insertIdx) {
   return reorderPdfMany([sourceIdx], insertIdx);
 }
 
+/** Scroll #viewer and #strip so page `idx` (0-based) is in view. Used after
+ *  page-rearranging operations (reorder/delete) whose persist() rebuild
+ *  would otherwise leave the viewer scrolled to the top, so the user has to
+ *  manually scroll back to wherever they were working. */
+function scrollToPage(idx) {
+  const frame = viewer.querySelector(`.page-frame[data-page-index="${idx}"]`);
+  if (frame) frame.scrollIntoView({ behavior: "auto", block: "start" });
+  const thumb = strip.querySelector(`.thumb[data-page-num="${idx + 1}"]`);
+  if (thumb) thumb.scrollIntoView({ behavior: "auto", block: "nearest", inline: "nearest" });
+}
+
 /**
  * Move multiple pages (sourceIndices, **must be unique + pre-sorted asc**)
  * to the given insertion point (insertIdx is expressed in the pre-move index
@@ -1800,6 +1892,8 @@ async function reorderPdfMany(sourceIndices, insertIdx) {
   state.lastClickedPage = preservedAnchor;
   state.selectionCursor = preservedCursor;
   updateThumbSelectionClass();
+  // Stay where the moved pages landed instead of resetting to page 1.
+  scrollToPage(target);
   toast(sources.length > 1
     ? t('msg.reorderMulti', {n: sources.length})
     : t('msg.reorderOne'));
@@ -1826,6 +1920,10 @@ async function deletePage(pageNum) {
     state.lastClickedPage -= 1;
   }
   await persist();
+  // Stay near the deleted page (the page that slid into its slot) instead
+  // of resetting to page 1.
+  const newTotal = state.pdfDoc.getPageCount();
+  if (newTotal > 0) scrollToPage(Math.min(removedIdx, newTotal - 1));
   toast(t('msg.deletedPage', {n: pageNum}));
 }
 
@@ -1855,6 +1953,10 @@ async function deletePagesMany(indices) {
   state.lastClickedPage = null;
   state.selectionCursor = null;
   await persist();
+  // Stay near the deleted block (the page that slid into its slot) instead
+  // of resetting to page 1.
+  const newTotal = state.pdfDoc.getPageCount();
+  if (newTotal > 0) scrollToPage(Math.min(sources[0], newTotal - 1));
   toast(t('msg.deletedPages', {n: sources.length}));
 }
 
@@ -1897,15 +1999,16 @@ async function rotatePages(angleDelta) {
     const cur = page.getRotation().angle;
     page.setRotation(degrees((cur + angleDelta + 360) % 360));
   }
-  // Preserve selection across persist.
-  const preservedSelection = new Set(state.selectedPages);
-  const preservedAnchor = state.lastClickedPage;
-  const preservedCursor = state.selectionCursor;
-  await persist();
-  state.selectedPages = preservedSelection;
-  state.lastClickedPage = preservedAnchor;
-  state.selectionCursor = preservedCursor;
-  updateThumbSelectionClass();
+  // Rotation doesn't add/remove/reorder pages, so avoid persist()'s full
+  // #viewer/#strip rebuild (which clears and re-renders every page from
+  // page 1 — a visible, multi-second "jump back to the start" on large
+  // scanned PDFs). Save the bytes, then patch only the rotated page(s) in
+  // place so the rest of the viewer — and its scroll position — never moves.
+  // Also supersede an in-flight full refresh. Without this, a refresh that
+  // started before rotation can append stale page nodes after the patch.
+  const myGen = ++state.renderGen;
+  await persistBytesOnly();
+  await patchPages(targets, myGen);
   const dir = t(angleDelta > 0 ? 'dir.right' : 'dir.left');
   toast(targets.length === 1
     ? t('msg.rotateOne', {n: targets[0] + 1, dir})
@@ -4174,7 +4277,8 @@ async function setZoom(newScale, opts = {}) {
   const prevTop = viewer.scrollTop;
   const prevTotal = viewer.scrollHeight || 1;
   const ratio = prevTop / prevTotal;
-  await renderPages();
+  const myGen = ++state.renderGen;
+  await renderPages(myGen);
   viewer.scrollTop = ratio * (viewer.scrollHeight || 1);
   if (!opts.quiet) toast(t('msg.zoom', {pct: Math.round(VIEW_SCALE * 100 / 1.4), scale: VIEW_SCALE.toFixed(2)}));
 }
