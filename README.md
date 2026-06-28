@@ -5,6 +5,15 @@ No server, no upload, no installation — just double-click and edit.
 
 **Current version: v1.5.0**
 
+## ▶ Use it online (no download)
+
+**[Open PDF Tool in your browser →](https://yadokari-works.github.io/pdf-tool/)**
+
+The online version runs **100% in your browser** — exactly like the downloadable
+packages. Your files are **never uploaded** anywhere; all processing is local.
+You can even turn off Wi-Fi after the page loads and keep editing.
+Switch the interface between Japanese and English with the **JP / EN** button.
+
 ## Features
 
 - **Text** annotations — type anywhere on the PDF
