@@ -1,0 +1,65 @@
+name: Deploy to GitHub Pages
+
+# バンドル版HTML(全ライブラリ内包・完全クライアントサイド)を
+# GitHub Pages に index.html として配信する。
+# 既に追跡済みの deploy/pdf_tool/pdf_tool_bundled.html を CI 時にコピーするため、
+# リポジトリに 5.7MB を二重コミットしない。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/pdf_tool/pdf_tool_bundled.html'
+      - 'deploy/pdf_tool/pdf_tool_bundled_en.html'
+      - 'deploy/pdf_tool/usage_guide.html'
+      - 'deploy/pdf_tool/使い方ガイド.html'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同時実行は1つに制限(古いデプロイは取り消す)
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble static site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          # 日本語UIバンドルをトップに(アプリ内に JP/EN 切替ボタンあり)
+          cp "deploy/pdf_tool/pdf_tool_bundled.html"    _site/index.html
+          # 英語UIバンドルも別名で配信
+          cp "deploy/pdf_tool/pdf_tool_bundled_en.html" _site/en.html
+          # 使い方ガイド(ASCII名で配信)
+          cp "deploy/pdf_tool/usage_guide.html"         _site/usage_guide.html
+          cp "deploy/pdf_tool/使い方ガイド.html"          _site/usage_guide_ja.html
+          # Jekyll 処理を無効化(ファイルをそのまま配信)
+          touch _site/.nojekyll
+          echo "Assembled files:"
+          ls -la _site
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
