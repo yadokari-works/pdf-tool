@@ -14,6 +14,11 @@ packages. Your files are **never uploaded** anywhere; all processing is local.
 You can even turn off Wi-Fi after the page loads and keep editing.
 Switch the interface between Japanese and English with the **JP / EN** button.
 
+## 📝 The story behind this tool (Japanese)
+
+Why I built it, what went wrong, and what I learned:
+[自分が欲しかったので、PDF編集ツールを作りました (note)](https://note.com/major_wasp3527/n/ne8ea3c8a3341)
+
 ## Features
 
 - **Text** annotations — type anywhere on the PDF
